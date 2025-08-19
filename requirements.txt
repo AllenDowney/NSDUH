@@ -1,0 +1,14 @@
+beautifulsoup4
+jupyter
+lxml
+numpy
+matplotlib
+openpyxl
+pandas
+pyreadstat
+seaborn
+scipy
+statadict
+statsmodels
+tables
+empiricaldist
