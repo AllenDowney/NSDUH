@@ -1,10 +1,15 @@
 import re
+import sys
 from bs4 import BeautifulSoup
 import requests
 import os
 from urllib.parse import urlparse
 import pandas as pd
 import shelve
+import matplotlib.pyplot as plt
+
+
+from utils import decorate
 
 def download_nsduh_tables(filename="2024-nsduh-detailed-tables-sect1pe.htm"):
     """
@@ -13,7 +18,8 @@ def download_nsduh_tables(filename="2024-nsduh-detailed-tables-sect1pe.htm"):
     Returns:
         str: Path to the downloaded file, or None if download failed
     """
-    url = "https://www.samhsa.gov/data/sites/default/files/reports/rpt56484/NSDUHDetailedTabs2024/NSDUHDetailedTabs2024/2024-nsduh-detailed-tables-sect1pe.htm#tab1.23a"
+    url_root = "https://www.samhsa.gov/data/sites/default/files/reports/rpt56484/NSDUHDetailedTabs2024/NSDUHDetailedTabs2024/"
+    url = url_root + filename
     
     # Create data directory if it doesn't exist
     data_dir = "data"
@@ -21,10 +27,10 @@ def download_nsduh_tables(filename="2024-nsduh-detailed-tables-sect1pe.htm"):
         os.makedirs(data_dir)
     
     # Extract filename from URL
-    parsed_url = urlparse(url)
-    filename = os.path.basename(parsed_url.path)
     filepath = os.path.join(data_dir, filename)
-    
+    print(filename)
+    print(url)
+
     # Check if file already exists
     if os.path.exists(filepath):
         print(f"File already exists: {filepath}")
@@ -107,19 +113,37 @@ def extract_tables_to_csv(html_filepath):
                 print(f"  Error saving table {i+1}: {e}")
                 continue
         
-        # Persist mappings to shelve
-        shelve_path = os.path.join(csv_dir, "tables_metadata")
+        # Persist mappings to shelve (append mode)
+        shelve_path = os.path.join("data", "tables_metadata")
         try:
+            # Load existing mappings if they exist, otherwise start from scratch
+            try:
+                existing_filename_to_title, existing_filename_to_number = load_table_mappings(shelve_path)
+            except Exception as e:
+                print(f"Warning: Could not load existing mappings: {e}")
+                existing_filename_to_title = {}
+                existing_filename_to_number = {}
+            
+            # Merge existing and new mappings
+            merged_filename_to_title = {**existing_filename_to_title, **filename_to_title}
+            merged_filename_to_number = {**existing_filename_to_number, **filename_to_number}
+            
+            # Save merged mappings back to shelve
             with shelve.open(shelve_path) as db:
-                db["filename_to_title"] = filename_to_title
-                db["filename_to_number"] = filename_to_number
+                db["filename_to_title"] = merged_filename_to_title
+                db["filename_to_number"] = merged_filename_to_number
+            
             print(f"\nSaved filename-to-title and filename-to-number mappings to shelve: {shelve_path}")
+            print(f"  Existing mappings: {len(existing_filename_to_title)}")
+            print(f"  New mappings: {len(filename_to_title)}")
+            print(f"  Total mappings: {len(merged_filename_to_title)}")
+            
         except Exception as e:
             print(f"\nWarning: Failed to save shelve metadata ({e})")
 
         print(f"\nSuccessfully extracted {len(csv_files)} tables to CSV files")
         return csv_files
-        
+
     except Exception as e:
         print(f"Error reading HTML file: {e}")
         return []
@@ -309,21 +333,24 @@ def clean_table(df):
     for col in df_clean.columns:
         if df_clean[col].dtype == 'object':  # String/object columns
             df_clean[col] = df_clean[col].apply(clean_value)
+            df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
     
     return df_clean
 
 
-def add_diffs(df):
+def add_diffs(df, years, group):
     """
-    Add difference columns showing year-over-year changes for each age group.
+    Add difference columns showing year-over-year changes and male-female differences.
     
     This function expects columns like:
     - 'Aged 12-17 (2023)', 'Aged 12-17 (2024)'
     - 'Aged 18+ (2023)', 'Aged 18+ (2024)'
     
     It adds new columns:
-    - 'Aged 12-17 (2024-2023)': Change from 2023 to 2024
-    - 'Aged 18+ (2024-2023)': Change from 2023 to 2024
+    - 'Aged 12-17 (change)': Change from 2023 to 2024
+    - 'Aged 18+ (change)': Change from 2023 to 2024
+    - 'Aged 12-17 (diff)': Male - Female difference for 12-17 age group
+    - 'Aged 18+ (diff)': Male - Female difference for 18+ age group
     
     Args:
         df (pandas.DataFrame): DataFrame with year columns for different age groups
@@ -331,64 +358,159 @@ def add_diffs(df):
     Returns:
         pandas.DataFrame: DataFrame with additional difference columns
     """
-    import pandas as pd
-    import numpy as np
+    df_group = pd.DataFrame()
+
+    # Create a copy to avoid modifying the original
+    year0, year1 = years    
+    col_year0 = f"{group} ({year0})"
+    col_year1 = f"{group} ({year1})"
+
+    df_group[year0] = df[col_year0]
+    df_group[year1] = df[col_year1]
+    changes = df_group[year1] - df_group[year0]
+    diff = df_group[year1].diff()
+
+    # Add the change column
+    df_group["Change"] = changes
+    df_group["Diff"] = diff
+    
+    return df_group
+
+
+def make_table(df, rows=None, groups=None, years=None):
+    """Make a table with the following columns:
+    - 'Aged 12-17 (2023)', 'Aged 12-17 (2024)', 'Aged 12-17 (change)', 'Aged 12-17 (diff)'
+    - 'Aged 18+ (2023)', 'Aged 18+ (2024)', 'Aged 18+ (change)', 'Aged 18+ (diff)'
+    """
+    if rows is None:
+        rows = ['Male', 'Female']
+    if groups is None:
+        groups = ['Aged 12-17', 'Aged 18+']
+    if years is None:
+        years = [2023, 2024]
+
+    table_dict = {}
+    for group in groups:
+        if years:
+            df_group = add_diffs(df.loc[rows], years, group)
+        else:
+            df_group = df.loc[rows, group]
+        table_dict[group] = df_group
+
+    return pd.concat(table_dict, axis=1)
+
+def clean_labels(df, label_prefix="Misuse of "):
+    """
+    Remove label_prefix text from the first level of a multiindex without changing order.
+    
+    This function is useful for cleaning NSDUH table labels where label_prefix 
+    appears in the first level of the multiindex, such as:
+    - "Misuse of Prescription Opioids" -> "Prescription Opioids"
+    - "Misuse of Prescription Stimulants" -> "Prescription Stimulants"
+    - "Any Fentanyl Use" -> "Fentanyl Use"
+    
+    Args:
+        df (pandas.DataFrame): DataFrame with a multiindex
+        
+    Returns:
+        pandas.DataFrame: DataFrame with cleaned multiindex labels
+    """
+    # Check if the dataframe has a multiindex
+    if not isinstance(df.index, pd.MultiIndex):
+        print("Warning: DataFrame does not have a multiindex")
+        return df
     
     # Create a copy to avoid modifying the original
-    df_with_diffs = df.copy()
+    df_clean = df.copy()
     
-    # Define the age groups and years we're looking for
-    age_groups = ['Aged 12-17', 'Aged 18+']
-    years = [2023, 2024]
+    # Get the first level of the multiindex
+    first_level = df_clean.index.get_level_values(0)
     
-    # For each age group, calculate the difference
-    for age_group in age_groups:
-        # Find the columns for this age group
-        col_2023 = f"{age_group} ({years[0]})"
-        col_2024 = f"{age_group} ({years[1]})"
+    # Clean the labels by removing label_prefix
+    cleaned_labels = []
+    for label in first_level:
+        if isinstance(label, str) and label.startswith(label_prefix):
+            cleaned_labels.append(label[len(label_prefix):])
+        else:
+            cleaned_labels.append(label)
+    
+    # Create new multiindex with cleaned first level
+    new_index = pd.MultiIndex.from_arrays([
+        cleaned_labels,
+        *[df_clean.index.get_level_values(i) for i in range(1, df_clean.index.nlevels)]
+    ], names=df_clean.index.names)
+    
+    # Assign the new index to the dataframe
+    df_clean.index = new_index
+    
+    return df_clean
+
+filename_to_title, filename_to_number = load_table_mappings()
+
+
+def prepare_table(table, section=1, suffix='B', 
+                   rows=None, groups=None, years=None):
+    number = f'{section}.{table}{suffix}'
+    filename = f'table_{number}.csv'
+    title = filename_to_title[filename]
+    table_info = parse_table_title(title)
+    desc = table_info['full_description']
+    key = desc.split(" in ")[0]
+    
+    df = pd.read_csv(f"data/{filename}", index_col=0)
+    df = clean_table(df)
+    return make_table(df, rows, groups, years)
+
+def compile_tables(tables, section=1, suffix='B', 
+                   rows=None, groups=None, years=None):
+    table_dict = {}
+
+    for table in tables:
+        table_dict[table] = prepare_table(table, section, suffix, rows, groups, years)
+        print(table)
         
-        # Check if both columns exist
-        if col_2023 in df_with_diffs.columns and col_2024 in df_with_diffs.columns:
-            # Create the difference column name
-            diff_col = f"{age_group} (change)"
-            
-            # Calculate differences, handling non-numeric values
-            try:
-                # Convert to numeric, coercing errors to NaN
-                values_2023 = pd.to_numeric(df_with_diffs[col_2023], errors='coerce')
-                values_2024 = pd.to_numeric(df_with_diffs[col_2024], errors='coerce')
-                
-                # Calculate difference (2024 - 2023)
-                diffs = values_2024 - values_2023
-                
-                # Add the difference column
-                df_with_diffs[diff_col] = diffs
-                
-            except Exception as e:
-                print(f"Warning: Could not calculate differences for {age_group}: {e}")
-                # Add NaN column if calculation fails
-                df_with_diffs[diff_col] = np.nan
+    table = pd.concat(table_dict)
+    return table
+
+def plot_percentages(table, **options):
+    table[2024].unstack(sort=False).plot(kind='barh')
+    plt.gca().invert_yaxis()
+    decorate(xlabel='Percent', **options)
+
+
+def plot_changes(table, **options):
+    table['Change'].unstack(sort=False).plot(kind='barh')
+    plt.gca().invert_yaxis()
+    decorate(xlabel='Change in percentage points', loc='lower right', **options)
+
+
+def process_section(section):
+    """
+    Process a section of the NSDUH detailed tables.
     
-    return df_with_diffs
+    Args:
+        section (str): The section of the NSDUH detailed tables to process.
+        
+    """
+    filename = f"2024-nsduh-detailed-tables-{section}.htm"
+    html_filepath = download_nsduh_tables(filename)
+    print(html_filepath)
+    
+    csv_files = extract_tables_to_csv(html_filepath)
+    if csv_files:
+        print(f"\nAll tables have been processed!")
+        print(f"CSV files are located in: data/csv/")
+        print(f"Total CSV files created: {len(csv_files)}")
+    else:
+        print("\nDownload failed. Please check the error messages above.")
+
+    filename_to_title, filename_to_number = load_table_mappings()
+    print(filename_to_title)
 
 
 if __name__ == "__main__":
-    if True:
-        # Download the tables when script is run directly
-        filename = "2024-nsduh-detailed-tables-sect1pe.htm"
-        html_filepath = download_nsduh_tables(filename)
-        
-        csv_files = extract_tables_to_csv(html_filepath)
-        if csv_files:
-            print(f"\nAll tables have been processed!")
-            print(f"CSV files are located in: data/csv/")
-            print(f"Total CSV files created: {len(csv_files)}")
-        else:
-            print("\nDownload failed. Please check the error messages above.")
-
-        filename_to_title, filename_to_number = load_table_mappings()
-        print(filename_to_title)
-    
+    section = 'sect7pe'
+    process_section(section)
     
     
 
